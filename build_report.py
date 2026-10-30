@@ -4,11 +4,13 @@
 Запуск:  python3 build_report.py
 """
 import csv
+from collections import Counter
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from needs import PAINS, PAIN_SHORT, PRODUCTS, SEGMENTS, TAGS
 from offers import OFFERS
 
 NICHES = {
@@ -33,6 +35,8 @@ COLUMNS = [
     ("problem", "Что не так (доказательства)"),
     ("offer1", "Предложение 1 (быстрый результат)"),
     ("offer2", "Предложение 2 (продукт посерьёзнее)"),
+    ("segment", "Сегмент"),
+    ("pains", "Типы проблем"),
     ("niche", "Ниши"),
     ("priority", "Приоритет для новичка"),
     ("dm", "Кому писать (ЛПР)"),
@@ -828,12 +832,146 @@ ROWS = [
 ]
 
 
+SEGMENT_OF = {c: f"{sid} {name}" for sid, name, comps, _ in SEGMENTS for c in comps}
+
+
+def pain_stats():
+    """Для каждого типа проблемы: сколько компаний и в каких сегментах он чаще всего."""
+    stats = []
+    for p in PAINS:
+        comps = [c for c, tags in TAGS.items() if p in tags]
+        seg = Counter(SEGMENT_OF[c].split(" ", 1)[1] for c in comps)
+        stats.append((p, comps, seg))
+    return sorted(stats, key=lambda x: -len(x[1]))
+
+
+def a_count(comps):
+    prio = {r["company"]: r["priority"] for r in ROWS}
+    return sum(prio[c] == "A" for c in comps)
+
+
+def coverage(codes):
+    return sum(1 for tags in TAGS.values() if set(codes) & set(tags))
+
+
+def wrap(ws, widths):
+    for col, w in zip("ABCDEFGHIJKLMNOP", widths):
+        ws.column_dimensions[col].width = w
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+
+def add_needs_sheets(wb):
+    ws = wb.create_sheet("Что нужно всем", 0)
+    ws.append(["Место", "Код", "Проблема", "Компаний из 100", "Продукт, который её закрывает",
+               "Где чаще всего (сегмент: компаний)", "Компании"])
+    for i, (p, comps, seg) in enumerate(pain_stats(), 1):
+        where = ", ".join(f"{name}: {n}" for name, n in seg.most_common(3))
+        ws.append([i, p, PAINS[p], len(comps), PRODUCTS[p], where, ", ".join(comps)])
+    wrap(ws, (7, 6, 48, 12, 52, 48, 90))
+
+    ss = wb.create_sheet("10 сегментов", 1)
+    ss.append(["Сегмент", "Компаний", "Из них приоритет A", "Главные проблемы (компаний в сегменте)",
+               "Один продукт на весь сегмент", "Компании"])
+    for sid, name, comps, product in SEGMENTS:
+        top = Counter(t for c in comps for t in TAGS[c]).most_common(4)
+        ss.append([f"{sid} {name}", len(comps), a_count(comps), ", ".join(f"{PAIN_SHORT[t]} ({n})" for t, n in top),
+                   product, ", ".join(comps)])
+    wrap(ss, (34, 10, 12, 46, 60, 90))
+
+    ms = wb.create_sheet("Матрица проблем", 2)
+    ms.append(["Компания", "Сегмент"] + [f"{p} {PAIN_SHORT[p]}" for p in PAINS] + ["Всего"])
+    for sid, name, comps, _ in SEGMENTS:
+        for c in comps:
+            ms.append([c, f"{sid} {name}"] + ["●" if p in TAGS[c] else "" for p in PAINS] + [len(TAGS[c])])
+    ms.append(["ИТОГО", ""] + [sum(p in t for t in TAGS.values()) for p in PAINS] + [""])
+    wrap(ms, (34, 30) + (11,) * len(PAINS) + (7,))
+    for row in ms.iter_rows(min_row=2):
+        for cell in row[2:]:
+            cell.alignment = Alignment(horizontal="center", vertical="top")
+    for cell in ms[ms.max_row]:
+        cell.font = Font(bold=True)
+    ms.freeze_panes = "C2"
+
+
+def write_needs_md():
+    stats = pain_stats()
+    lines = [
+        "# Что нужно этим 100 компаниям",
+        "",
+        "Каждую из 100 компаний я разметил по 12 типам проблем (по колонке «Что не так»).",
+        f"У средней компании {sum(len(t) for t in TAGS.values()) / len(TAGS):.1f} проблемы.",
+        "Ниже видно, какие проблемы повторяются чаще всего, какие продукты закрывают сразу много компаний",
+        "и на какие 10 групп компании делятся. Всё это есть и в таблице: листы «Что нужно всем»,",
+        "«10 сегментов» и «Матрица проблем».",
+        "",
+        "## Главный вывод",
+        "",
+        f"- **{coverage(['P1'])} из 100** компаний не успевают отвечать клиентам. Это самая частая проблема.",
+        f"- **{coverage(['P1', 'P2', 'P3', 'P11'])} из 100** теряют клиента на коммуникации: не отвечают, не сообщают "
+        "статус заказа или рефанда, не выполняют обещания. Один продукт «AI-поддержка + статусы» закрывает их всех.",
+        f"- **{coverage(['P5', 'P6'])} из 100** нужен ремонт сайта или приложения. Это услуга (аудит и исправления), "
+        "а не один продукт: у каждой компании свой сайт.",
+        f"- Три вещи вместе (поддержка, статусы, починка сайта) покрывают **{coverage(['P1', 'P2', 'P3', 'P11', 'P5', 'P6'])} из 100**.",
+        "",
+        "## Рейтинг проблем",
+        "",
+        "| # | Проблема | Компаний | Что продавать | Где чаще всего |",
+        "|---|---|---|---|---|",
+    ]
+    for i, (p, comps, seg) in enumerate(stats, 1):
+        where = ", ".join(f"{name} ({n})" for name, n in seg.most_common(2))
+        lines.append(f"| {i} | {PAINS[p]} | **{len(comps)}** | {PRODUCTS[p]} | {where} |")
+    lines += [
+        "",
+        "## 10 сегментов: кому что продавать",
+        "",
+        "Внутри одного сегмента проблемы почти одинаковые, поэтому продукт, сделанный для одной компании,",
+        "можно почти без изменений продать остальным.",
+        "",
+        "| Сегмент | Компаний | Из них приоритет A | Главные проблемы | Один продукт на сегмент |",
+        "|---|---|---|---|---|",
+    ]
+    for sid, name, comps, product in SEGMENTS:
+        top = Counter(t for c in comps for t in TAGS[c]).most_common(3)
+        pains = ", ".join(f"{PAIN_SHORT[t]} ({n} из {len(comps)})" for t, n in top)
+        lines.append(f"| **{sid} {name}** | {len(comps)} | {a_count(comps)} | {pains} | {product} |")
+    lines += ["", "### Компании по сегментам", ""]
+    for sid, name, comps, _ in SEGMENTS:
+        lines.append(f"- **{sid} {name}:** " + ", ".join(comps))
+    lines += [
+        "",
+        "## Что делать с этим",
+        "",
+        "1. **Сделать один базовый продукт, «AI-поддержка + статусы».** Входящие письма сортируются по теме и срочности,",
+        "   AI пишет черновик ответа, у каждого обращения есть таймер SLA. Клиент сам видит статус заказа, рефанда или",
+        "   ремонта и получает письмо раньше, чем начнёт жаловаться. Это нужно 7 компаниям из 10.",
+        "2. **Добавлять модули под сегмент:** портал возвратов (онлайн-магазины), фото-претензии и гарантия (бренды),",
+        "   запись визитов (жильё и установка), кабинет подписки (подписки), трекер жалоб под регулятором (финансы, коммуналка).",
+        "   Основа одна, модули меняются.",
+        "3. **Продавать аудит сайта как первый шаг.** Он нужен 4 компаниям из 10, стоит недорого и быстро показывает,",
+        "   что вы умеете. После аудита проще продать продукт.",
+        "4. **Начать с одного сегмента.** Больше всего компаний с приоритетом A (их проще всего взять первыми)",
+        "   у брендов-производителей (S2, 6 компаний) и онлайн-магазинов (S1, 4 компании). Для них хватает базового",
+        "   продукта плюс модуля фото-претензий или возвратов. Сделали для одной компании — показываете кейс",
+        "   остальным 10–12 компаниям того же сегмента.",
+        "",
+    ]
+    with open("NEEDS.md", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
 def build():
     assert set(OFFERS) == {r["company"] for r in ROWS}, set(OFFERS) ^ {r["company"] for r in ROWS}
     for i, r in enumerate(ROWS, 1):
         r["n"] = i
         r["offer1"], r["offer2"] = OFFERS[r["company"]]
         r["size"] = SIZE_LABEL[r["size"]]
+        r["segment"] = SEGMENT_OF[r["company"]]
+        r["pains"] = "; ".join(f"{p} {PAIN_SHORT[p]}" for p in TAGS[r["company"]])
     assert len(ROWS) == 100, len(ROWS)
 
     with open("UK_100_companies.csv", "w", newline="", encoding="utf-8-sig") as f:
@@ -855,7 +993,7 @@ def build():
     for r in ROWS:
         ws.append([r[key] for key, _ in COLUMNS])
     widths = {"n": 5, "company": 28, "ticker": 9, "market": 10, "size": 16, "sector": 20, "site": 24,
-              "problem": 70, "offer1": 55, "offer2": 55, "niche": 9, "priority": 10, "dm": 34, "emails": 44,
+              "problem": 70, "offer1": 55, "offer2": 55, "segment": 22, "pains": 30, "niche": 9, "priority": 10, "dm": 34, "emails": 44,
               "pattern": 40, "phone": 26, "notes": 34, "sources": 50}
     for idx, (key, _) in enumerate(COLUMNS, 1):
         ws.column_dimensions[get_column_letter(idx)].width = widths[key]
@@ -867,6 +1005,8 @@ def build():
         p.fill = PatternFill("solid", fgColor=prio_fill[p.value])
     ws.freeze_panes = "C2"
     ws.auto_filter.ref = ws.dimensions
+
+    add_needs_sheets(wb)
 
     ns = wb.create_sheet("Ниши")
     ns.append(["Код", "Ниша", "Компаний в списке", "Компании (приоритет A)"])
@@ -896,6 +1036,7 @@ def build():
             cell.alignment = Alignment(wrap_text=True, vertical="top")
 
     wb.save("UK_100_companies.xlsx")
+    write_needs_md()
     counts = {p: sum(r["priority"] == p for r in ROWS) for p in "ABC"}
     offers = sum(bool(r["offer1"]) + bool(r["offer2"]) for r in ROWS)
     print("rows:", len(ROWS), "offers:", offers, "priority:", counts)
